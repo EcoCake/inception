@@ -1,0 +1,628 @@
+INCEPTION - EVERYTHING YOU NEED TO KNOW
+=======================================
+
+Contents
+  1. What the project is
+  2. The big picture: what happens when you visit the site
+  3. Core concepts (the "explain in simple terms" part of the evaluation)
+  4. The files, one by one
+  5. What happens when you type `make`
+  6. Walking through the evaluation sheet
+  7. Changing the configuration during the defense
+  8. Questions you will probably get, with answers
+  9. Troubleshooting
+ 10. Quick command reference
+
+
+1. WHAT THE PROJECT IS
+----------------------
+
+A WordPress website split into three containers, built from our own
+Dockerfiles and started with Docker Compose, all inside a virtual machine.
+
+  nginx      the only door into the system. HTTPS on port 443 only,
+             TLS 1.2 or 1.3.
+  wordpress  WordPress (PHP code) run by php-fpm. No web server inside.
+  mariadb    the database. Stores posts, pages, users, comments.
+
+Rules the subject insists on, and how we follow them:
+
+  - One Dockerfile per service, written by us      -> requirements/<service>/
+  - Base image: penultimate stable Debian/Alpine   -> debian:bookworm (12)
+    (Debian 13 "trixie" is the current stable, so 12 is the penultimate one)
+  - No ready-made images (no nginx, wordpress, mariadb from Docker Hub)
+  - Image name = service name                      -> nginx:1.0, wordpress:1.0...
+  - No "latest" tag                                -> we use the tag 1.0
+  - NGINX only entry point, port 443, TLSv1.2/1.3  -> only nginx has `ports:`
+  - Two named volumes, data in /home/amezoe/data   -> driver_opts in compose
+  - A docker network                               -> `inception` network
+  - Containers restart after a crash               -> restart: always
+  - No passwords in Dockerfiles or in git          -> secrets/ (git-ignored)
+  - Must use environment variables + a .env file   -> srcs/.env
+  - Two WordPress users, admin name without
+    "admin"/"administrator"                        -> boss (admin), writer
+  - No hacky infinite processes (tail -f, sleep
+    infinity, while true, bash)                    -> services run as PID 1
+  - Domain amezoe.42.fr points to the local IP     -> line in /etc/hosts
+
+
+2. THE BIG PICTURE
+------------------
+
+  Firefox (in the VM)
+     |  https://amezoe.42.fr   ->  /etc/hosts says amezoe.42.fr = 127.0.0.1
+     v
+  port 443 of the VM  --(published by Docker)-->  nginx container :443
+     |
+     |  static files (css, images, js): nginx reads them itself from the
+     |  shared "wordpress" volume (/var/www/html)
+     |
+     |  .php files: nginx forwards them with the FastCGI protocol
+     v
+  wordpress container :9000  (php-fpm runs the PHP code)
+     |
+     |  SQL queries
+     v
+  mariadb container :3306
+
+  All three containers are on the private Docker network "inception".
+  Only nginx publishes a port to the VM. wordpress:9000 and mariadb:3306 are
+  reachable only from inside that network.
+
+  Volumes:
+    wordpress volume -> /home/amezoe/data/wordpress  (used by nginx + wordpress)
+    mariadb volume   -> /home/amezoe/data/mariadb    (used by mariadb)
+
+
+3. CORE CONCEPTS
+----------------
+
+3.1 Docker, images, containers
+
+  Image:      a read-only template: a filesystem (Debian + installed packages
+              + our files) plus a default command. Built from a Dockerfile.
+              Each Dockerfile instruction creates a layer; layers are cached,
+              so rebuilding is fast when little changed.
+  Container:  a running instance of an image. It is just a normal Linux
+              process, isolated using kernel features:
+                - namespaces: own view of processes, network, filesystem,
+                  hostname (the container thinks it is alone)
+                - cgroups: limits on CPU / memory
+              The container gets a thin writable layer on top of the image.
+              When the container is deleted, that layer is gone. That is why
+              data that must survive lives in volumes.
+  Dockerfile: the recipe for an image (FROM, RUN, COPY, EXPOSE, ENTRYPOINT).
+  Docker Hub: public registry of images. We only pull debian:bookworm from it.
+
+3.2 Docker Compose
+
+  Compose reads one YAML file (docker-compose.yml) that describes the whole
+  application: services, how to build them, networks, volumes, secrets,
+  ports, environment, start order, restart policy.
+  `docker compose up` builds what is needed and creates everything in the
+  right order; `docker compose down` removes it.
+
+3.3 Image with Compose vs without Compose
+
+  The image itself is identical; only the way you build and run it differs.
+
+  Without compose you type everything by hand, for each container:
+    docker network create inception
+    docker volume create ...   (with all the options)
+    docker build -t mariadb:1.0 srcs/requirements/mariadb
+    docker run -d --name mariadb --network inception -v ... --env-file ...
+               --restart always mariadb:1.0
+    ... same for wordpress, then nginx, in the right order, with -p 443:443.
+
+  With compose all of that is written once in docker-compose.yml and you
+  run one command. Compose also handles: start order (depends_on), waiting
+  for health, naming (project name prefix: inception_mariadb), recreating
+  only what changed, and tearing everything down cleanly.
+
+3.4 Docker vs Virtual Machines
+
+  VM:        emulates a full computer. Has its own kernel, boots a full OS.
+             Strong isolation, but heavy: GBs of disk, minutes to boot,
+             reserved RAM.
+  Container: shares the host's kernel. Only isolates processes.
+             Starts in about a second, MBs instead of GBs, many can run at
+             once, and the image runs the same on any machine with Docker.
+             Weaker isolation (same kernel).
+  This project uses both: the containers run inside a Debian VM.
+  Benefits of Docker: lightweight, fast, reproducible ("works on my machine"
+  problem solved), one service per container, easy to rebuild or replace.
+
+3.5 Why the directory structure
+
+  Makefile                at the root: one entry point for everything.
+  secrets/                outside srcs and ignored by git: passwords never
+                          get committed.
+  srcs/                   everything Compose needs.
+  srcs/docker-compose.yml describes the whole stack.
+  srcs/.env               settings (domain, usernames), not committed.
+  srcs/requirements/<x>/  one folder per service = one build context.
+                          When Docker builds an image it only sends that
+                          folder (the "build context") to the builder, so
+                          each image only contains its own files.
+    Dockerfile            the recipe
+    tools/                scripts used at container start
+    config/               configuration files (nginx only here)
+
+3.6 Docker network vs host network
+
+  We use a user-defined bridge network called inception
+  (Docker names it inception_inception: project name + network name).
+  - Every container gets its own IP on that private network.
+  - Docker runs a small DNS server (127.0.0.11) inside the network, so
+    containers find each other by service name: nginx connects to
+    "wordpress:9000", WordPress connects to "mariadb".
+  - Nothing is reachable from outside unless published with `ports:`.
+    We publish only nginx's 443.
+  Host network (network: host): the container uses the VM's network stack
+  directly. Every port it opens is open on the machine, no isolation, no
+  name resolution between services. Forbidden by the subject.
+  `links:` / `--link`: the old, deprecated way of connecting containers.
+  Also forbidden. User-defined networks replaced them.
+
+3.7 Docker volumes vs bind mounts
+
+  Bind mount: you map a host path straight into a container
+              (`- /home/amezoe/data:/var/lib/mysql`). Docker does not manage
+              it; it depends on the host's folder layout.
+  Named volume: an object Docker manages. It has a name, you can list it
+              (`docker volume ls`), inspect it, remove it, and services refer
+              to it by name.
+  The subject wants named volumes, but with the data in /home/amezoe/data.
+  We do that with the local driver's options:
+      driver_opts:
+        type: none
+        o: bind
+        device: /home/amezoe/data/mariadb
+  Honest detail if asked: under the hood the local driver mounts that folder
+  with a bind mount, but it is still a named volume: created, listed,
+  inspected and removed through Docker, and referenced by name in compose.
+  `docker volume inspect inception_mariadb` shows the device path.
+
+3.8 Secrets vs environment variables
+
+  Environment variables: easy, but visible to every process in the
+  container, shown by `docker inspect`, often printed in logs.
+  Docker secrets: files mounted read-only at /run/secrets/<name>, only in
+  the services that declare them, not in `docker inspect`, not baked into
+  images.
+  What we use:
+    srcs/.env (env vars): DOMAIN_NAME, DATA_PATH, HTTPS_PORT, database name,
+                          usernames, emails, site title
+    secrets/*.txt:        db_root_password, db_password, wp_admin_password,
+                          wp_user_password
+  The scripts read a secret with $(cat /run/secrets/db_password).
+  Both srcs/.env and secrets/ are in .gitignore. The repo only has
+  srcs/.env.example (no passwords). `make` creates the real files.
+
+3.9 PID 1, daemons, exec, and why "tail -f" is forbidden
+
+  Inside a container, the first process is PID 1. The container lives as
+  long as PID 1 lives. `docker stop` sends SIGTERM to PID 1.
+  Daemons: programs like nginx, php-fpm, mariadb normally "daemonize": they
+  fork into the background and the starting process exits. In a container,
+  that would make PID 1 exit and the container stop.
+  The bad fix: start the service in the background and keep the container
+  alive with `tail -f /dev/null`, `sleep infinity`, `while true`. Then PID 1
+  is a fake process: Docker cannot see if the real service crashed, signals
+  go to the wrong process, no clean shutdown. Forbidden.
+  The right fix: run the service in the FOREGROUND as PID 1:
+    nginx -g "daemon off;"   nginx stays in the foreground
+    php-fpm8.2 -F            -F = foreground
+    mariadbd                 runs in the foreground by default
+  Our setup scripts do their first-start work, then end with `exec <service>`.
+  exec REPLACES the shell process with the service (same PID), so the
+  service becomes PID 1. Check: docker exec nginx cat /proc/1/cmdline
+  ENTRYPOINT ["sh", "/setup.sh"] is allowed: sh is only used to run a script.
+
+3.10 TLS / SSL
+
+  TLS encrypts traffic between browser and server (HTTPS). SSL is the old
+  name; SSLv3, TLS 1.0 and 1.1 are obsolete and insecure, so we only allow
+  TLSv1.2 and TLSv1.3 (`ssl_protocols TLSv1.2 TLSv1.3;`).
+  The certificate is self-signed (generated with openssl, not signed by a
+  known authority), so the browser warns. The subject says that is fine.
+  The private key is generated when the container starts, so it is never
+  stored inside the image.
+
+3.11 FastCGI and php-fpm
+
+  nginx cannot execute PHP. php-fpm (FastCGI Process Manager) is a pool of
+  PHP workers listening on port 9000. nginx passes each .php request with
+  the FastCGI protocol (`fastcgi_pass wordpress:9000;`), php-fpm runs it and
+  returns the HTML. That's why WordPress needs no web server in its container.
+
+
+4. THE FILES, ONE BY ONE
+------------------------
+
+4.1 Makefile
+
+  COMPOSE = docker compose -f srcs/docker-compose.yml
+
+  all (default): runs setup, then `docker compose up -d --build`
+                 (-d = in the background / detached, --build = rebuild
+                 images if Dockerfiles or files changed).
+  include srcs/.env : Make reads the .env file to get DATA_PATH.
+                 If srcs/.env doesn't exist, the rule `srcs/.env:` creates
+                 it by copying srcs/.env.example, then Make reloads.
+  setup:   creates /home/amezoe/data/mariadb, /home/amezoe/data/wordpress
+           and secrets/, then creates each missing secret file with
+           `openssl rand -hex 16` (32 random hex characters).
+  down:    stop and remove the containers and network. Data kept.
+  clean:   down + remove the volumes (-v) and our images (--rmi all).
+           Data on the host is kept.
+  fclean:  clean + delete /home/amezoe/data (sudo, because files belong to
+           container users) and secrets/.
+  re:      down then all.
+
+4.2 srcs/docker-compose.yml
+
+  name: inception          project name, used as prefix: inception_mariadb...
+  services:
+    build: requirements/x  where the Dockerfile is (path relative to srcs/)
+    image: x:1.0           name given to the built image (= service name,
+                           tag 1.0 because "latest" is forbidden). Nothing is
+                           pulled: with `build` + `up --build`, it's built.
+    container_name: x      fixed container name (nginx, wordpress, mariadb)
+    env_file: .env         loads srcs/.env as environment variables
+    secrets: [...]         which secrets appear in /run/secrets/
+    ports: "${HTTPS_PORT}:443"   only on nginx: VM port -> container port
+    volumes: name:/path    mount the named volume at that path
+    networks: [inception]
+    depends_on:            start order. wordpress waits for mariadb to be
+      mariadb:             "healthy" (see healthcheck), nginx waits for
+        condition: service_healthy    wordpress to be started.
+    healthcheck (mariadb): every 3s runs `mariadb-admin ping`. It succeeds
+                           as soon as the server answers (even if it says
+                           "access denied", the server is alive).
+                           Up to 20 tries.
+    restart: always        Docker restarts the container if it crashes or
+                           exits, and when the Docker daemon starts (reboot).
+  networks: inception, bridge driver.
+  volumes: the two named volumes with driver_opts (see 3.7).
+  secrets: each secret name -> file in ../secrets/.
+
+4.3 srcs/.env.example -> srcs/.env
+
+  DOMAIN_NAME=amezoe.42.fr      used for the cert and WordPress URL
+  DATA_PATH=/home/amezoe/data   where the volumes store data
+  HTTPS_PORT=443                public port (change for the defense test)
+  MYSQL_DATABASE, MYSQL_USER    database name and user for WordPress
+  WP_TITLE, WP_ADMIN_USER=boss, WP_ADMIN_EMAIL, WP_USER=writer, WP_USER_EMAIL
+
+4.4 nginx
+
+  Dockerfile:
+    FROM debian:bookworm
+    RUN apt-get install nginx openssl, delete Debian's default site and
+        default html page
+    COPY config/default -> /etc/nginx/conf.d/default.conf
+    COPY tools/setup.sh
+    EXPOSE 443   (documentation only, does not publish anything)
+    ENTRYPOINT ["sh", "/setup.sh"]
+
+  tools/setup.sh:
+    if there is no certificate yet, create a self-signed one with openssl
+    (CN = DOMAIN_NAME), then `exec nginx -g "daemon off;"`.
+    The "+++..." lines in `docker logs nginx` are only openssl's progress
+    output while generating the key.
+
+  config/default:
+    listen 443 ssl;                       HTTPS only, no port 80 at all
+    ssl_certificate / ssl_certificate_key the generated files
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /var/www/html; index index.php;  the shared WordPress volume
+    location / { try_files $uri $uri/ /index.php?$args; }
+        serve the file if it exists, otherwise let WordPress handle the URL
+    location ~ \.php$ { include fastcgi.conf; fastcgi_pass wordpress:9000; }
+        send PHP to php-fpm. fastcgi.conf sets SCRIPT_FILENAME etc.
+
+4.5 wordpress
+
+  Dockerfile:
+    FROM debian:bookworm
+    apt-get install php8.2-fpm (runs PHP), php8.2-cli (needed by wp-cli),
+        php8.2-mysql (PHP talks to MariaDB), curl
+    download wp-cli (the WordPress command-line tool) to /usr/local/bin/wp
+    mkdir /run/php (php-fpm's pid folder)
+    sed: make php-fpm listen on port 9000 instead of a unix socket, so nginx
+         in another container can reach it over the network
+    WORKDIR /var/www/html, EXPOSE 9000, ENTRYPOINT ["sh", "/setup.sh"]
+
+  tools/setup.sh (every start, each step is skipped if already done):
+    URL = https://amezoe.42.fr (adds :PORT if HTTPS_PORT is not 443)
+    alias wp = wp --allow-root --url=URL  (we run as root in the container)
+    1. no WordPress files?    -> wp core download
+    2. no wp-config.php?      -> wp config create (db name, user, password
+                                 from the secret, host "mariadb")
+    3. not installed?         -> wp core install (title, admin boss + secret
+                                 password), wp user create writer (role
+                                 author), and let logged-in users' comments
+                                 appear without moderation
+    4. always: set home/siteurl to URL (so a port change keeps working)
+    5. chown files to www-data (the user php-fpm runs as)
+    6. exec php-fpm8.2 -F  (foreground, PID 1)
+  set -e: if any command fails (e.g. database not reachable), the script
+  stops, the container exits and restart: always tries again.
+  No waiting loop: compose already waited for mariadb to be healthy.
+
+4.6 mariadb
+
+  Dockerfile:
+    FROM debian:bookworm
+    apt-get install mariadb-server
+    rm -rf /var/lib/mysql/*  the package creates a default database. If we
+        kept it, Docker would copy it into the empty volume on first start
+        and our script would think setup was already done.
+    mkdir /run/mysqld (socket and pid folder), owned by mysql
+    EXPOSE 3306, ENTRYPOINT ["sh", "/setup.sh"]
+
+  tools/setup.sh:
+    chown the data folder to the mysql user
+    if /var/lib/mysql/mysql doesn't exist (first start):
+      mariadb-install-db       creates the system tables
+      mariadbd --bootstrap     runs SQL without starting networking:
+        set root's password (from secret), create the wordpress database,
+        create wpuser@'%' ('%' = from any host, needed because WordPress
+        connects from another container), grant it all rights on that
+        database only
+    exec mariadbd --user=mysql --bind-address=0.0.0.0 --port=3306
+                  --log-warnings=1
+      bind-address=0.0.0.0: listen on all interfaces (Debian's default is
+      127.0.0.1, which would only accept connections from inside the
+      container itself). --log-warnings=1 hides the healthcheck's
+      "access denied" messages.
+
+4.7 Documentation files
+
+  README.md    first line in italics with the login, Description,
+               Instructions, Resources + how AI was used, and the four
+               comparisons (VM/Docker, secrets/env, network/host,
+               volumes/bind mounts).
+  USER_DOC.md  for a user/admin: services, start/stop, URLs, credentials,
+               checks.
+  DEV_DOC.md   for a developer: setup from scratch, Makefile, commands,
+               data location, config changes.
+
+
+5. WHAT HAPPENS WHEN YOU TYPE `make`
+------------------------------------
+
+  1. Make needs srcs/.env. Missing? It copies .env.example.
+  2. setup: create data folders and missing secrets.
+  3. docker compose up -d --build:
+     a. builds mariadb:1.0, wordpress:1.0, nginx:1.0 from the Dockerfiles
+        (pulls debian:bookworm the first time)
+     b. creates the network inception_inception
+     c. creates the volumes inception_mariadb, inception_wordpress
+     d. starts mariadb -> first start: creates DB and users -> healthy
+     e. starts wordpress -> downloads WordPress, creates config, installs
+        the site and users -> php-fpm running
+     f. starts nginx -> creates the certificate -> listening on 443
+  4. Second `make`: nothing to rebuild, data exists, setup steps skipped.
+
+
+6. WALKING THROUGH THE EVALUATION SHEET
+---------------------------------------
+
+Before starting (the evaluator runs this; ONLY ever run it in the VM, it
+deletes ALL containers, images, volumes and networks on the machine):
+  docker stop $(docker ps -qa); docker rm $(docker ps -qa);
+  docker rmi -f $(docker images -qa); docker volume rm $(docker volume ls -q);
+  docker network rm $(docker network ls -q) 2>/dev/null
+  sudo rm -rf /home/amezoe/data/*
+Then `make`. The secrets already exist locally (they are not in git).
+
+General checks they read in the files:
+  - no "network: host", no "links:", no "--link"            OK
+  - "networks" present in docker-compose.yml                 OK
+  - no tail -f / sleep infinity / while true / bash in background   OK
+  - FROM debian:bookworm in each Dockerfile                  OK
+  - Makefile at root, everything else in srcs                OK
+
+Simple setup / NGINX:
+  https://amezoe.42.fr               -> the site (not the install page)
+  http://amezoe.42.fr                -> must NOT connect (nothing on port 80)
+  curl -I http://amezoe.42.fr        -> "Failed to connect" = correct
+  Show TLS version:
+    Firefox: click the padlock -> Connection -> More information
+    or: openssl s_client -connect amezoe.42.fr:443 -tls1_2 </dev/null
+        (works)
+        openssl s_client -connect amezoe.42.fr:443 -tls1_1 </dev/null
+        (fails)
+  Why no http->https redirect? A redirect needs nginx listening on port 80,
+  and the sheet requires that port 80 cannot connect at all.
+
+Docker basics:
+  docker compose -f srcs/docker-compose.yml ps
+  docker images        -> nginx:1.0  wordpress:1.0  mariadb:1.0  (+ debian)
+  docker history nginx:1.0   -> shows our own build steps (proof we built it)
+
+Docker network:
+  docker network ls                      -> inception_inception
+  docker network inspect inception_inception   -> the three containers
+
+WordPress + volume:
+  docker volume ls
+  docker volume inspect inception_wordpress   -> "device":
+                                              "/home/amezoe/data/wordpress"
+  Comment: log in as writer (password: cat secrets/wp_user_password.txt),
+           comment on "Hello world!"
+  Admin:   https://amezoe.42.fr/wp-admin, user boss
+           (password: cat secrets/wp_admin_password.txt)
+           -> Pages -> edit a page -> Save -> check it on the site
+
+MariaDB + volume:
+  docker volume inspect inception_mariadb   -> /home/amezoe/data/mariadb
+  Log in to the database:
+    docker exec -it mariadb mariadb -u wpuser -p wordpress
+    (password: cat secrets/db_password.txt)
+  or as root:
+    docker exec -it mariadb sh -c \
+      'mariadb -u root -p"$(cat /run/secrets/db_root_password)" wordpress'
+  Show it's not empty:
+    SHOW TABLES;
+    SELECT user_login FROM wp_users;
+    SELECT post_title FROM wp_posts WHERE post_type='page';
+    exit
+
+Persistence:
+  sudo reboot -> log in -> cd ~/Desktop/inception -> make
+  (containers usually already restarted by themselves because of
+  restart: always; `make` makes sure). Edits and comments are still there
+  because they live in /home/amezoe/data.
+
+
+7. CHANGING THE CONFIGURATION DURING THE DEFENSE
+------------------------------------------------
+
+The public port (most likely request):
+  nano srcs/.env  -> HTTPS_PORT=8443
+  make re
+  open https://amezoe.42.fr:8443   (port 443 no longer works, that's normal)
+  WordPress updates its URL at start, so links keep the :8443.
+  Put it back: HTTPS_PORT=443, make re.
+
+nginx's internal port (e.g. 4443):
+  config/default: listen 4443 ssl;
+  docker-compose.yml: "${HTTPS_PORT}:4443"
+  (optionally EXPOSE 4443 in the nginx Dockerfile)
+  make re
+
+php-fpm's port (e.g. 9001):
+  wordpress/Dockerfile: listen = 9001 in the sed line
+  nginx config/default: fastcgi_pass wordpress:9001;
+  make re
+
+MariaDB's port (e.g. 3307), in this order, with the stack running:
+  1. docker exec wordpress wp config set DB_HOST mariadb:3307 --allow-root
+  2. mariadb/tools/setup.sh: --port=3307
+  3. wordpress/tools/setup.sh: --dbhost=mariadb:3307  (for fresh installs)
+  4. make re
+  Check: docker exec mariadb sh -c 'mariadb -uroot \
+    -p"$(cat /run/secrets/db_root_password)" -e "SHOW VARIABLES LIKE \"port\""'
+  If you forgot step 1, WordPress keeps restarting. Fix it on the host:
+    sudo sed -i "s/'mariadb'/'mariadb:3307'/" \
+      /home/amezoe/data/wordpress/wp-config.php
+    make re
+  No compose change needed: the port is not published, and containers on
+  the same network can reach any port.
+
+Site title, usernames, emails: only applied at first install.
+Changing them in .env later needs `make fclean && make` (fresh install).
+Same for passwords in secrets/.
+
+
+8. QUESTIONS YOU WILL PROBABLY GET
+----------------------------------
+
+Q: Why Debian and not Alpine?
+A: Allowed by the subject, and "penultimate" stays the same longer
+   (Debian releases about every 2 years, Alpine every 6 months).
+   Packages and docs are familiar. Alpine images would be smaller.
+
+Q: What is the difference between EXPOSE and ports?
+A: EXPOSE only documents which port the app uses. `ports:` in compose
+   actually publishes a container port on the VM. Only nginx has `ports:`.
+
+Q: Why does nginx share the wordpress volume?
+A: nginx serves static files (images, CSS, JS) directly from disk and only
+   sends .php to php-fpm. Both need to see the same files at the same path.
+
+Q: How does WordPress find the database?
+A: Through Docker's DNS: the hostname "mariadb" (the service name) resolves
+   to the mariadb container's IP on the inception network.
+
+Q: How do you make sure WordPress starts after MariaDB?
+A: depends_on with condition: service_healthy plus a healthcheck on mariadb.
+   If they still start in the wrong order (e.g. after a reboot), the
+   wordpress script fails (set -e), the container exits, and restart: always
+   retries until MariaDB is ready. No loop in any script.
+
+Q: What happens if a container crashes?
+A: restart: always restarts it. Test: docker exec nginx sh -c 'kill 1'
+   (stops PID 1), then docker ps shows it up again.
+
+Q: Why is the image tagged 1.0?
+A: Image names must equal service names, and without a tag Docker uses
+   "latest", which the subject forbids. The tag doesn't pull anything; the
+   image is built from our Dockerfile.
+
+Q: Where are passwords? Why not in .env?
+A: In secrets/*.txt, mounted at /run/secrets/ only in the services that
+   need them. Not in docker inspect, not in images, not in git. They're
+   generated by `make` with openssl.
+
+Q: Why is the admin called boss?
+A: The admin username can't contain admin/administrator.
+
+Q: Why is there no "Error establishing a database connection" at start?
+A: WordPress only starts after mariadb is healthy, and the user/database
+   are created on MariaDB's first start before it becomes healthy.
+
+Q: What is php-fpm -F / nginx daemon off?
+A: Keep the service in the foreground so it can be PID 1 (see 3.9).
+
+Q: Why `exec` at the end of the scripts?
+A: So the service replaces the shell and becomes PID 1, receiving signals
+   from `docker stop` and letting Docker see if it dies.
+
+Q: What is the difference between `make down`, `clean`, `fclean`?
+A: down = containers + network. clean = also volumes and images (data on
+   disk kept). fclean = also the data folder and the secrets.
+
+Q: Is the volume really not a bind mount?
+A: It's a named volume managed by Docker (ls, inspect, rm, used by name).
+   The local driver's options make it store its data in /home/amezoe/data.
+   The subject requires exactly this.
+
+Q: Why does the browser warn about the certificate?
+A: It's self-signed; no trusted authority signed it. Traffic is still
+   encrypted with TLS 1.2/1.3. The subject allows the warning.
+
+Q: How did you use AI?
+A: Be honest and specific (it's written in the README Resources section),
+   and be ready to explain every line yourself.
+
+
+9. TROUBLESHOOTING
+------------------
+
+Site doesn't load:
+  docker compose -f srcs/docker-compose.yml ps   all Up? mariadb healthy?
+  grep HTTPS_PORT srcs/.env       not 443? then use https://amezoe.42.fr:PORT
+  grep amezoe /etc/hosts          must be: 127.0.0.1 amezoe.42.fr
+  curl -kI https://amezoe.42.fr   200 = server fine, browser issue (try a
+                                  private window)
+Container keeps restarting:
+  docker logs wordpress   (or mariadb / nginx)
+"Error establishing a database connection":
+  docker logs mariadb; check DB_HOST if you changed MariaDB's port
+Wrong password / changed a secret but nothing changed:
+  passwords are set only at first install -> make fclean && make
+Permission denied on docker:
+  user not in docker group -> sudo usermod -aG docker amezoe, then reboot
+make fails with "no such file or directory" on the volume:
+  the data folder is missing -> make (setup recreates it) or make fclean
+
+
+10. QUICK COMMAND REFERENCE
+---------------------------
+
+  make / make down / make re / make clean / make fclean
+  docker compose -f srcs/docker-compose.yml ps
+  docker compose -f srcs/docker-compose.yml logs -f
+  docker logs <container>
+  docker exec -it <container> sh          open a shell inside
+  docker images
+  docker volume ls / docker volume inspect inception_mariadb
+  docker network ls / docker network inspect inception_inception
+  docker exec <container> cat /proc/1/cmdline    what runs as PID 1
+  cat secrets/wp_admin_password.txt       admin password (user: boss)
+  cat secrets/wp_user_password.txt        author password (user: writer)
+  cat secrets/db_password.txt             database password (user: wpuser)
