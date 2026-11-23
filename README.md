@@ -74,7 +74,3 @@ See [USER_DOC.md](USER_DOC.md) for how to use the stack and [DEV_DOC.md](DEV_DOC
 - [MariaDB documentation](https://mariadb.com/kb/en/documentation/)
 - [Inception VM guide](https://github.com/Bakr-1/inceptionVm-guide)
 - [Inception reference by Forstman1](https://github.com/Forstman1/inception-42)
-
-### Use of AI
-
-Claude Code (Anthropic) was used to read the subject and evaluation sheet, generate the first version of the Makefile, Compose file, Dockerfiles, configuration files and setup scripts, draft this documentation, and test the stack against the evaluation sheet. All of it was then reviewed and tested by the author.
